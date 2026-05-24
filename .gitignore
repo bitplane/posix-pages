@@ -1,0 +1,5 @@
+tools/
+test/tmp/
+test/tmp-bin/
+out/
+!out/.gitkeep

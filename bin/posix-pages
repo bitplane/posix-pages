@@ -1,0 +1,565 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    echo "usage: posix-pages build [-s source] [-d dest]" >&2
+    exit 2
+}
+
+command=${1:-}
+[ "$command" = build ] || usage
+shift
+
+src=.
+dest=_site
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -s|--source)
+            [ "$#" -ge 2 ] || usage
+            src=$2
+            shift 2
+            ;;
+        -d|--destination)
+            [ "$#" -ge 2 ] || usage
+            dest=$2
+            shift 2
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+
+awk_bin=${AWK:-awk}
+awkdown=${AWKDOWN:-awkdown}
+awkyaml=${AWKYAML:-awkyaml}
+awkuid=${AWKUID:-awkuid}
+
+tmp=${TMPDIR:-/tmp}/posix-pages.$$
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+mkdir -p "$tmp"
+site_events=$tmp/site.events
+
+src=$(cd "$src" && pwd)
+mkdir -p "$dest"
+dest=$(cd "$dest" && pwd)
+
+event_escape() {
+    "$awk_bin" '
+    {
+        if (NR > 1) {
+            printf "\\n"
+        }
+        gsub(/\\/, "\\\\")
+        gsub(/\t/, "\\t")
+        gsub(/\r/, "\\r")
+        gsub(/\n/, "\\n")
+        gsub(/\//, "\\/")
+        printf "%s", $0
+    }'
+}
+
+event_escape_path() {
+    "$awk_bin" '
+    {
+        gsub(/\\/, "\\\\")
+        gsub(/\t/, "\\t")
+        gsub(/\r/, "\\r")
+        gsub(/\n/, "\\n")
+        printf "%s", $0
+    }'
+}
+
+event_path_join() {
+    event_path_join_parent=$1
+    event_path_join_key=$2
+    event_path_join_escaped=$(printf '%s' "$event_path_join_key" | event_escape_path)
+    if [ "$event_path_join_parent" = "" ]; then
+        printf '%s' "$event_path_join_escaped"
+    else
+        printf '%s/%s' "$event_path_join_parent" "$event_path_join_escaped"
+    fi
+}
+
+event_scalar() {
+    event_scalar_path=$1
+    event_scalar_value=$2
+    event_scalar_escaped=$(printf '%s' "$event_scalar_value" | event_escape)
+    printf 'SCALAR\t0\t%s\t!!str\t\tplain\t%s\n' "$event_scalar_path" "$event_scalar_escaped"
+}
+
+event_map_start() {
+    printf 'MAP_START\t0\t%s\t!!map\t\n' "$1"
+}
+
+event_map_end() {
+    printf 'MAP_END\t0\t%s\n' "$1"
+}
+
+event_seq_start() {
+    printf 'SEQ_START\t0\t%s\t!!seq\t\n' "$1"
+}
+
+event_seq_end() {
+    printf 'SEQ_END\t0\t%s\n' "$1"
+}
+
+prefix_events() {
+    prefix_events_prefix=$1
+    "$awk_bin" -v prefix="$prefix_events_prefix" '
+    BEGIN { FS = OFS = "\t" }
+    function esc(text,    out, i, ch) {
+        out = ""
+        for (i = 1; i <= length(text); i++) {
+            ch = substr(text, i, 1)
+            if (ch == "\\") out = out "\\\\"
+            else if (ch == "\t") out = out "\\t"
+            else if (ch == "\r") out = out "\\r"
+            else if (ch == "\n") out = out "\\n"
+            else if (ch == "\b") out = out "\\b"
+            else if (ch == "/") out = out "\\/"
+            else out = out ch
+        }
+        return out
+    }
+    function join_path(parent, path) {
+        if (path == "") return parent
+        return parent "/" path
+    }
+    $1 == "DOC_START" || $1 == "DOC_END" { next }
+    {
+        $3 = join_path(esc(prefix), $3)
+        print
+    }'
+}
+
+split_front_matter() {
+    split_front_matter_in=$1
+    split_front_matter_yaml=$2
+    split_front_matter_body=$3
+    "$awk_bin" -v yaml="$split_front_matter_yaml" -v body="$split_front_matter_body" '
+    NR == 1 && $0 == "---" {
+        fm = 1
+        next
+    }
+    fm && $0 == "---" {
+        fm = 0
+        body_started = 1
+        next
+    }
+    fm {
+        print > yaml
+        next
+    }
+    {
+        print > body
+    }
+    END {
+        close(yaml)
+        close(body)
+    }' "$split_front_matter_in"
+}
+
+preprocess_liquid_template() {
+    preprocess_liquid_template_in=$1
+    preprocess_liquid_template_out=$2
+    preprocess_liquid_template_base=$3
+    "$awk_bin" -v base="$preprocess_liquid_template_base" '
+    function read_file(path,    line, out, first) {
+        out = ""
+        first = 1
+        while ((getline line < path) > 0) {
+            out = out (first ? "" : "\n") line
+            first = 0
+        }
+        close(path)
+        return out
+    }
+    function include_relative_path(tag,    rest, parts) {
+        rest = tag
+        sub(/^[ \t\r\n]*include_relative[ \t\r\n]+/, "", rest)
+        sub(/[ \t\r\n]*$/, "", rest)
+        split(rest, parts, /[ \t\r\n]+/)
+        return parts[1]
+    }
+    {
+        line = $0
+        while (match(line, /{%-?[ \t\r\n]*include_relative[ \t\r\n]+[^%]+-?%}/)) {
+            before = substr(line, 1, RSTART - 1)
+            tag = substr(line, RSTART + 2, RLENGTH - 4)
+            after = substr(line, RSTART + RLENGTH)
+            gsub(/^-/, "", tag)
+            gsub(/-$/, "", tag)
+            rel = include_relative_path(tag)
+            if (rel != "") {
+                line = before read_file(base "/" rel) after
+            } else {
+                line = before after
+            }
+        }
+        print line
+    }' "$preprocess_liquid_template_in" > "$preprocess_liquid_template_out"
+}
+
+prepare_includes() {
+    prepare_includes_dir=$1
+    prepare_includes_out=$2
+    mkdir -p "$prepare_includes_out"
+    if [ ! -d "$prepare_includes_dir" ]; then
+        return
+    fi
+    find "$prepare_includes_dir" -type f | while IFS= read -r prepare_includes_file; do
+        prepare_includes_rel=${prepare_includes_file#"$prepare_includes_dir"/}
+        prepare_includes_dest=$prepare_includes_out/$prepare_includes_rel.liquid
+        mkdir -p "$(dirname "$prepare_includes_dest")"
+        cp "$prepare_includes_file" "$prepare_includes_dest"
+    done
+}
+
+render_liquid() {
+    render_liquid_template=$1
+    render_liquid_events=$2
+    render_liquid_out=$3
+    render_liquid_dir=$4
+    "$awk_bin" -v liquid_template_dir="$render_liquid_dir" -f "$awkuid" "$render_liquid_template" < "$render_liquid_events" > "$render_liquid_out"
+}
+
+front_matter_value() {
+    front_matter_value_file=$1
+    front_matter_value_key=$2
+    if [ ! -s "$front_matter_value_file" ]; then
+        return
+    fi
+    "$awk_bin" -F '\t' -v key="$front_matter_value_key" '$1 == "SCALAR" && $3 == key { print $7; exit }' "$("$awkyaml" "$front_matter_value_file" > "$tmp/front-value.events"; printf '%s' "$tmp/front-value.events")"
+}
+
+derive_page_title() {
+    derive_page_title_file=$1
+    "$awk_bin" '
+    function trim(text) {
+        sub(/^[ \t]+/, "", text)
+        sub(/[ \t]+$/, "", text)
+        return text
+    }
+    /^[ \t]{0,3}#[ \t]+/ {
+        text = $0
+        sub(/^[ \t]{0,3}#[ \t]+/, "", text)
+        sub(/[ \t]+#+[ \t]*$/, "", text)
+        print trim(text)
+        exit
+    }' "$derive_page_title_file"
+}
+
+add_heading_ids() {
+    "$awk_bin" '
+    function html_text(text) {
+        gsub(/<[^>]*>/, "", text)
+        gsub(/&amp;/, "\\&", text)
+        gsub(/&lt;/, "<", text)
+        gsub(/&gt;/, ">", text)
+        gsub(/&quot;/, "\"", text)
+        gsub(/&#39;/, "\047", text)
+        return text
+    }
+    function slugify_heading(text,    out, i, ch, last_dash) {
+        text = tolower(html_text(text))
+        out = ""
+        last_dash = 0
+        for (i = 1; i <= length(text); i++) {
+            ch = substr(text, i, 1)
+            if (ch ~ /[a-z0-9]/) {
+                out = out ch
+                last_dash = 0
+            } else if (ch ~ /[ \t\r\n_-]/) {
+                if (out != "" && !last_dash) {
+                    out = out "-"
+                    last_dash = 1
+                }
+            }
+        }
+        sub(/-$/, "", out)
+        return out
+    }
+    /^<h[1-6]>/ {
+        level = substr($0, 3, 1)
+        close_tag = "</h" level ">"
+        text = $0
+        sub("^<h" level ">", "", text)
+        sub(close_tag "$", "", text)
+        id = slugify_heading(text)
+        if (id != "") {
+            print "<h" level " id=\"" id "\">" text close_tag
+            next
+        }
+    }
+    { print }'
+}
+
+slugify() {
+    printf '%s' "$1" | "$awk_bin" '
+    {
+        out = tolower($0)
+        gsub(/[^a-z0-9]+/, "-", out)
+        gsub(/^-+/, "", out)
+        gsub(/-+$/, "", out)
+        printf "%s", out
+    }'
+}
+
+post_parts() {
+    post_parts_rel=$1
+    post_parts_base=${post_parts_rel##*/}
+    post_year=${post_parts_base%%-*}
+    post_rest=${post_parts_base#*-}
+    post_month=${post_rest%%-*}
+    post_rest=${post_rest#*-}
+    post_day=${post_rest%%-*}
+    post_title_ext=${post_rest#*-}
+    post_title=${post_title_ext%.*}
+    post_category=${post_parts_rel%_posts/*}
+    if [ "$post_category" = "$post_parts_rel" ]; then
+        post_category=
+    fi
+    post_category=${post_category%/}
+}
+
+write_site_events() {
+    write_site_events_out=$1
+    {
+    event_map_start site
+    if [ -f "$src/_config.yml" ]; then
+        "$awkyaml" "$src/_config.yml" | prefix_events site
+    fi
+    event_seq_start site/pages
+    page_i=0
+    find "$src" -type f | while IFS= read -r emit_site_context_file; do
+        emit_site_context_rel=${emit_site_context_file#"$src"/}
+        case "$emit_site_context_rel" in
+            *_posts/*|_*/*|_config.yml|_config.yaml)
+                ;;
+            *.md|*.markdown|*.html|*.htm)
+                event_map_start "site/pages/$page_i"
+                event_scalar "site/pages/$page_i/path" "$emit_site_context_rel"
+                event_scalar "site/pages/$page_i/url" "$(url_for "$emit_site_context_rel")"
+                event_map_end "site/pages/$page_i"
+                page_i=$((page_i + 1))
+                ;;
+        esac
+    done
+    event_seq_end site/pages
+    event_seq_start site/posts
+    post_i=0
+    find "$src" -type f | while IFS= read -r emit_site_context_file; do
+        emit_site_context_rel=${emit_site_context_file#"$src"/}
+        case "$emit_site_context_rel" in
+            *_posts/[0-9][0-9][0-9][0-9]-*-*-*)
+                post_parts "$emit_site_context_rel"
+                event_map_start "site/posts/$post_i"
+                event_scalar "site/posts/$post_i/path" "$emit_site_context_rel"
+                event_scalar "site/posts/$post_i/title" "$post_title"
+                event_scalar "site/posts/$post_i/date" "$post_year-$post_month-$post_day"
+                if [ "$post_category" != "" ]; then
+                    event_scalar "site/posts/$post_i/url" "/$post_category/$post_year/$post_month/$post_day/$post_title.html"
+                else
+                    event_scalar "site/posts/$post_i/url" "/$post_year/$post_month/$post_day/$post_title.html"
+                fi
+                event_map_end "site/posts/$post_i"
+                post_i=$((post_i + 1))
+                ;;
+        esac
+    done
+    event_seq_end site/posts
+    event_map_end site
+    } > "$write_site_events_out"
+}
+
+emit_page_context() {
+    emit_page_context_yaml=$1
+    emit_page_context_rel=$2
+    emit_page_context_url=$3
+    emit_page_context_title=$4
+    event_map_start page
+    if [ -s "$emit_page_context_yaml" ]; then
+        "$awkyaml" "$emit_page_context_yaml" | prefix_events page
+    fi
+    if [ "$emit_page_context_title" != "" ]; then
+        event_scalar page/title "$emit_page_context_title"
+    fi
+    event_scalar page/path "$emit_page_context_rel"
+    event_scalar page/url "$emit_page_context_url"
+    event_map_end page
+}
+
+write_context_events() {
+    write_context_events_out=$1
+    write_context_events_yaml=$2
+    write_context_events_rel=$3
+    write_context_events_url=$4
+    write_context_events_title=$5
+    {
+        printf 'DOC_START\t0\n'
+        event_map_start ""
+        cat "$site_events"
+        emit_page_context "$write_context_events_yaml" "$write_context_events_rel" "$write_context_events_url" "$write_context_events_title"
+        event_map_end ""
+        printf 'DOC_END\t0\n'
+    } > "$write_context_events_out"
+}
+
+output_path_for() {
+    output_path_for_rel=$1
+    case "$output_path_for_rel" in
+        *_posts/[0-9][0-9][0-9][0-9]-*-*-*)
+            post_parts "$output_path_for_rel"
+            if [ "$post_category" != "" ]; then
+                printf '%s/%s/%s/%s/%s.html' "$post_category" "$post_year" "$post_month" "$post_day" "$post_title"
+            else
+                printf '%s/%s/%s/%s.html' "$post_year" "$post_month" "$post_day" "$post_title"
+            fi
+            ;;
+        *)
+            printf '%s.html' "${output_path_for_rel%.*}"
+            ;;
+    esac
+}
+
+url_for() {
+    url_for_out=$(output_path_for "$1")
+    case "$url_for_out" in
+        index.html)
+            printf '/'
+            ;;
+        */index.html)
+            printf '/%s/' "${url_for_out%/index.html}"
+            ;;
+        *)
+            printf '/%s' "$url_for_out"
+            ;;
+    esac
+}
+
+has_front_matter() {
+    has_front_matter_file=$1
+    has_front_matter_first=$(sed -n '1p' "$has_front_matter_file")
+    [ "$has_front_matter_first" = "---" ]
+}
+
+is_post_path() {
+    case "$1" in
+        *_posts/[0-9][0-9][0-9][0-9]-*-*-*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+render_page() {
+    file=$1
+    rel=${file#"$src"/}
+    ext=${rel##*.}
+    yaml=$tmp/front.yml
+    body=$tmp/body
+    prepared_body=$tmp/body.prepared
+    liquid_body=$tmp/body.liquid.out
+    html=$tmp/body.html
+    html_with_ids=$tmp/body.ids.html
+    events=$tmp/context.events
+    page_events=$tmp/page.events
+    out_rel=$(output_path_for "$rel")
+    page_url=$(url_for "$rel")
+
+    split_front_matter "$file" "$yaml" "$body"
+
+    published=$(front_matter_value "$yaml" published || true)
+    if [ "$published" = false ]; then
+        return
+    fi
+
+    page_title=$(front_matter_value "$yaml" title || true)
+    if [ "$page_title" = "" ]; then
+        page_title=$(derive_page_title "$body")
+    else
+        page_title=
+    fi
+
+    write_context_events "$page_events" "$yaml" "$rel" "$page_url" "$page_title"
+
+    preprocess_liquid_template "$body" "$prepared_body" "$(dirname "$file")"
+    render_liquid "$prepared_body" "$page_events" "$liquid_body" "$tmp/includes"
+
+    case "$ext" in
+        md|markdown)
+            "$awk_bin" -f "$awkdown" "$liquid_body" > "$html"
+            add_heading_ids < "$html" > "$html_with_ids"
+            cp "$html_with_ids" "$html"
+            ;;
+        html|htm)
+            cp "$liquid_body" "$html"
+            ;;
+        *)
+            cp "$liquid_body" "$html"
+            ;;
+    esac
+
+    layout=$("$awk_bin" -F '\t' '$1 == "SCALAR" && $3 == "page/layout" { print $7; exit }' "$page_events")
+    if [ "$layout" = "" ] && [ -f "$src/_layouts/default.html" ]; then
+        layout=default
+    fi
+    out=$dest/$out_rel
+    mkdir -p "$(dirname "$out")"
+
+    if [ "$layout" != "" ] && [ -f "$src/_layouts/$layout.html" ]; then
+        {
+            "$awk_bin" '
+            BEGIN { FS = "\t" }
+            $1 == "DOC_END" { next }
+            $1 == "MAP_END" && $3 == "" { next }
+            { print }
+            ' "$page_events"
+            printf 'SCALAR\t0\tcontent\t!!str\t\tplain\t'
+            event_escape < "$html"
+            printf '\nMAP_END\t0\t'
+            printf '\nDOC_END\t0\n'
+        } > "$events"
+        render_liquid "$src/_layouts/$layout.html" "$events" "$out" "$tmp/includes"
+    else
+        cp "$html" "$out"
+    fi
+}
+
+copy_static() {
+    copy_static_file=$1
+    copy_static_rel=${copy_static_file#"$src"/}
+    copy_static_out=$dest/$copy_static_rel
+    mkdir -p "$(dirname "$copy_static_out")"
+    cp "$copy_static_file" "$copy_static_out"
+}
+
+prepare_includes "$src/_includes" "$tmp/includes"
+write_site_events "$site_events"
+
+find "$src" -type f | while IFS= read -r file; do
+    rel=${file#"$src"/}
+    case "$rel" in
+        .git/*|.github/*)
+            ;;
+        _config.yml|_config.yaml|_layouts/*|_includes/*|_data/*|_sass/*|_drafts/*)
+            ;;
+        *.md|*.markdown)
+            render_page "$file"
+            ;;
+        *.html|*.htm)
+            if has_front_matter "$file"; then
+                render_page "$file"
+            else
+                copy_static "$file"
+            fi
+            ;;
+        *)
+            copy_static "$file"
+            ;;
+    esac
+done

@@ -1,0 +1,86 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.awk }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - awk: awk
+            runner: awk
+          - awk: gawk
+            runner: gawk
+          - awk: busybox awk
+            runner: busybox-awk
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check out awkdown
+        uses: actions/checkout@v4
+        with:
+          repository: bitplane/awkdown
+          path: awkdown
+
+      - name: Check out awkyaml
+        uses: actions/checkout@v4
+        with:
+          repository: bitplane/awkyaml
+          path: awkyaml
+
+      - name: Check out awkuid
+        uses: actions/checkout@v4
+        with:
+          repository: bitplane/awkuid
+          path: awkuid
+
+      - name: Install AWK implementations
+        run: sudo apt-get update && sudo apt-get install -y busybox gawk
+
+      - name: Build tools
+        run: |
+          make -C awkdown build
+          make -C awkyaml build
+          make -C awkuid build
+
+      - name: Create AWK runners
+        run: |
+          mkdir -p .ci-bin
+
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'exec awk "$@"' \
+            > .ci-bin/awk
+
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'exec gawk "$@"' \
+            > .ci-bin/gawk
+
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'exec busybox awk "$@"' \
+            > .ci-bin/busybox-awk
+
+          chmod +x .ci-bin/awk .ci-bin/gawk .ci-bin/busybox-awk
+
+      - name: Run tests
+        run: |
+          make test \
+            AWK="./.ci-bin/${{ matrix.runner }}" \
+            AWKDOWN="./awkdown/build/awkdown" \
+            AWKYAML="./awkyaml/build/awkyaml" \
+            AWKUID="./awkuid/build/awkuid"
