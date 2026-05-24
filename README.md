@@ -2,9 +2,11 @@
 
 A small POSIX shell static site generator that wires together:
 
-- `awkdown` for GitHub Flavored Markdown
-- `awkyaml` for YAML front matter and config
-- `awkuid` for Liquid templates
+- [`awkdown`](https://github.com/bitplane/awkdown) for GitHub Flavoured Markdown
+- [`awkyaml`](https://github.com/bitplane/awkyaml) for front matter and config
+- [`awkuid`](https://github.com/bitplane/awkuid) for Liquid templates
+
+`make install` those before running.
 
 This is currently a vertical slice, not a complete GitHub Pages clone.
 
