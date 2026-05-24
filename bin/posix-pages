@@ -185,7 +185,7 @@ preprocess_liquid_template() {
     }
     {
         line = $0
-        while (match(line, /{%-?[ \t\r\n]*include_relative[ \t\r\n]+[^%]+-?%}/)) {
+        while (match(line, /[{][%]-?[ \t\r\n]*include_relative[ \t\r\n]+[^%]+-?[%][}]/)) {
             before = substr(line, 1, RSTART - 1)
             tag = substr(line, RSTART + 2, RLENGTH - 4)
             after = substr(line, RSTART + RLENGTH)
